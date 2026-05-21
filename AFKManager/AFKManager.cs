@@ -242,67 +242,63 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
     }
     
     private void AfkTimer_Callback()
+{
+    // 檢查比賽狀態與熱身設置
+    if (_gGameRulesProxy == null || _gGameRulesProxy.FreezePeriod || (Config.SkipWarmup && _gGameRulesProxy.WarmupPeriod))
+        return;
+
+    var players = Utilities.GetPlayers().Where(x => x is { IsBot: false, Connected: PlayerConnectedState.PlayerConnected });
+    
+    foreach (var player in players)
     {
-        if (_gGameRulesProxy == null || _gGameRulesProxy.FreezePeriod || (Config.SkipWarmup && _gGameRulesProxy.WarmupPeriod))
-            return;
+        if (player.ControllingBot || !_gPlayerInfo.TryGetValue(player.Index, out var data))
+            continue;
 
-        var players = Utilities.GetPlayers().Where(x => x is { IsBot: false, Connected: PlayerConnectedState.PlayerConnected }).ToList();
-        var playersCount = players.Count;
-        
-        foreach (var player in players)
+        if (player is { LifeState: (byte)LifeState_t.LIFE_ALIVE, Team: CsTeam.Terrorist or CsTeam.CounterTerrorist })
         {
-            if (player.ControllingBot || !_gPlayerInfo.TryGetValue(player.Index, out var data))
-                continue;
-            
-            #region AFK Time
-            if (player is { LifeState: (byte)LifeState_t.LIFE_ALIVE, Team: CsTeam.Terrorist or CsTeam.CounterTerrorist })
+            var playerPawn = player.PlayerPawn.Value;
+            var angles = playerPawn?.EyeAngles;
+            var origin = player.PlayerPawn.Value?.CBodyComponent?.SceneNode?.AbsOrigin;
+
+            if (data.Angles.X == angles?.X && data.Angles.Y == angles?.Y && data.Origin.X == origin?.X && data.Origin.Y == origin?.Y)
             {
-                var playerPawn = player.PlayerPawn.Value;
-                var playerFlags = player.Pawn.Value!.Flags;
+                data.AfkTime += Config.Timer;
+                if (data.AfkTime < Config.AfkWarnInterval) continue;
 
-                if ((playerFlags & ((uint)PlayerFlags.FL_ONGROUND | (uint)PlayerFlags.FL_FROZEN)) != (uint)PlayerFlags.FL_ONGROUND)
-                    continue;
-                
-                var angles = playerPawn?.EyeAngles;
-                var origin = player.PlayerPawn.Value?.CBodyComponent?.SceneNode?.AbsOrigin;
-                
-                /*  ------------------------------------------->  <-------------------------------------------  */
-                if (Config.AfkPunishAfterWarnings != 0
-                    && !(Config.AfkSkipFlag.Count >= 1 && AdminManager.PlayerHasPermissions(player, Config.AfkSkipFlag.ToArray()))
-                    && data.Angles.X == angles.X && data.Angles.Y == angles.Y
-                    && data.Origin.X == origin.X && data.Origin.Y == origin.Y)
+                // 達到警告上限，執行懲罰
+                if (data.AfkWarningCount >= Config.AfkPunishAfterWarnings)
                 {
-                    data.AfkTime += Config.Timer;
+                    string msgKey = Config.AfkPunishment switch { 0 => "ChatKillMessage", 1 => "ChatMoveMessage", _ => "ChatKickMessage" };
+                    Server.PrintToChatAll(ReplaceVars(player, Localizer[msgKey].Value));
                     
-                    if (data.AfkTime < Config.AfkWarnInterval)
-                        continue;
-                    
-                    if (Config.AfkTransferC4AfterWarnings != 0 && player.TeamNum == 2 && Config.AfkTransferC4AfterWarnings == data.AfkWarningCount &&
-                        HasC4(player))
-                    {
-                        if (!Config.AfkTransferC4OnlyFromBuyZone || playerPawn.InBuyZone)
-                        {
-                            CCSPlayer_WeaponServices weaponService =
-                                new(player.PlayerPawn?.Value?.WeaponServices?.Handle ?? nint.Zero);
-                            CBasePlayerWeapon weapon =
-                                new(weaponService.MyWeapons.FirstOrDefault(w =>
-                                        w.IsValid && w.Value != null && w.Value.DesignerName == "weapon_c4")?.Value
-                                    ?.Handle ?? nint.Zero);
+                    // 執行具體懲罰動作
+                    if (Config.AfkPunishment == 0) playerPawn?.CommitSuicide(false, true);
+                    else if (Config.AfkPunishment == 1) player.ChangeTeam(CsTeam.Spectator);
+                    else Server.ExecuteCommand($"kickid {player.UserId}");
 
-                            if (weapon.IsValid)
-                            {
-                                var nearestPlayer = FindNearestPlayer(player);
-                                if (nearestPlayer != null)
-                                {
-                                    RemoveC4(weaponService, weapon);
-                                    nearestPlayer.GiveNamedItem("weapon_c4");
-                                    Server.PrintToChatAll(ReplaceVars(player,
-                                        Localizer["ChatBombTransfer"].Value
-                                            .Replace("{targetPlayerName}", nearestPlayer.PlayerName)));
-                                }
-                            }
-                        }
-                    }
+                    data.AfkWarningCount = 0;
+                    data.AfkTime = 0;
+                    continue;
+                }
+
+                // 發送警告 (根據懲罰類型選擇對應的警告語言 Key)
+                string warnKey = Config.AfkPunishment switch { 0 => "ChatWarningKillMessage", 1 => "ChatWarningMoveMessage", _ => "ChatWarningKickMessage" };
+                float remainingTime = (Config.AfkPunishAfterWarnings - data.AfkWarningCount) * Config.AfkWarnInterval;
+                player.PrintToChat(ReplaceVars(player, Localizer[warnKey].Value, remainingTime));
+                
+                data.AfkWarningCount++;
+                data.AfkTime = 0;
+            }
+            else
+            {
+                data.AfkTime = 0;
+                data.AfkWarningCount = 0;
+                data.Angles = new QAngle(angles?.X, angles?.Y, angles?.Z);
+                data.Origin = new Vector(origin?.X, origin?.Y, origin?.Z);
+            }
+        }
+    }
+}
                     
                     if (data.AfkWarningCount == Config.AfkPunishAfterWarnings)
                     {
