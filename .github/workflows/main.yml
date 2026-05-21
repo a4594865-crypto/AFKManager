@@ -17,16 +17,19 @@ jobs:
       with:
         dotnet-version: 8.0.x
 
-    - name: Restore dependencies
-      run: dotnet restore
+    # 這行指令會自動尋找任何目錄下的 .csproj 並執行還原與編譯，自動解決路徑問題
+    - name: Build all projects
+      run: |
+        find . -name "*.csproj" -print -exec dotnet restore {} \;
+        find . -name "*.csproj" -print -exec dotnet build {} --configuration Release --no-restore \;
 
-    - name: Build
-      run: dotnet build --configuration Release --no-restore
+    - name: Collect Artifacts
+      run: |
+        mkdir -p build_output
+        find . -name "*.dll" -not -path "*/obj/*" -not -path "*/bin/Debug/*" -exec cp {} build_output/ \;
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
         name: plugin-build
-        path: |
-          bin/Release/net8.0/
-          !bin/Release/net8.0/*.deps.json
+        path: build_output/
