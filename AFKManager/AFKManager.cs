@@ -68,20 +68,26 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
         if (_gGameRulesProxy == null || _gGameRulesProxy.FreezePeriod || (Config.SkipWarmup && _gGameRulesProxy.WarmupPeriod))
             return;
 
-        var players = Utilities.GetPlayers().Where(x => x is { IsBot: false, Connected: PlayerConnectedState.PlayerConnected });
+        // 修正點 1: 使用 .Connected 來匹配 API
+        var players = Utilities.GetPlayers().Where(x => x is { IsBot: false, Connected: PlayerConnectedState.Connected });
         
         foreach (var player in players)
         {
-            if (player.ControllingBot || !_gPlayerInfo.TryGetValue(player.Index, out var data))
+            // 修正點 2: 使用 TryGetValue 並確保變數 data 在後續流程中是有效的
+            if (player.ControllingBot || !_gPlayerInfo.TryGetValue(player.Index, out var data) || data == null)
                 continue;
 
             if (player is { LifeState: (byte)LifeState_t.LIFE_ALIVE, Team: CsTeam.Terrorist or CsTeam.CounterTerrorist })
             {
                 var playerPawn = player.PlayerPawn.Value;
-                var angles = playerPawn?.EyeAngles;
-                var origin = playerPawn?.CBodyComponent?.SceneNode?.AbsOrigin;
+                if (playerPawn == null) continue;
 
-                if (data.Angles.X == angles?.X && data.Angles.Y == angles?.Y && data.Origin.X == origin?.X && data.Origin.Y == origin?.Y)
+                var angles = playerPawn.EyeAngles;
+                var origin = playerPawn.CBodyComponent?.SceneNode?.AbsOrigin;
+
+                if (data.Angles != null && data.Origin != null &&
+                    data.Angles.X == angles?.X && data.Angles.Y == angles?.Y && 
+                    data.Origin.X == origin?.X && data.Origin.Y == origin?.Y)
                 {
                     data.AfkTime += Config.Timer;
                     if (data.AfkTime < Config.AfkWarnInterval) continue;
@@ -91,7 +97,7 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
                         string msgKey = Config.AfkPunishment switch { 0 => "ChatKillMessage", 1 => "ChatMoveMessage", _ => "ChatKickMessage" };
                         Server.PrintToChatAll(ReplaceVars(player, Localizer[msgKey].Value));
                         
-                        if (Config.AfkPunishment == 0) playerPawn?.CommitSuicide(false, true);
+                        if (Config.AfkPunishment == 0) playerPawn.CommitSuicide(false, true);
                         else if (Config.AfkPunishment == 1) player.ChangeTeam(CsTeam.Spectator);
                         else Server.ExecuteCommand($"kickid {player.UserId}");
 
