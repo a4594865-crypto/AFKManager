@@ -31,7 +31,8 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
     public void OnConfigParsed(AFKManagerConfig config)
     {
         Config = config;
-        AddTimer(Config.Timer, AfkTimer_Callback, TimerFlags.REPEAT);
+        // ✅ 僅在此處加上了 | TimerFlags.STOP_ON_MAPCHANGE，確保換地圖時計時器安全關閉，不干涉設定檔的運作
+        AddTimer(Config.Timer, AfkTimer_Callback, TimerFlags.REPEAT | TimerFlags.STOP_ON_MAPCHANGE);
     }
 
     private class PlayerInfo
@@ -73,8 +74,10 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
         
         foreach (var player in players)
         {
-            // 修正點 2: 使用 TryGetValue 並確保變數 data 在後續流程中是有效的
-            if (player.ControllingBot || !_gPlayerInfo.TryGetValue(player.Index, out var data) || data == null)
+            // 修正點 2: 將原先的 player.Index 改為 (uint)player.Slot + 1，精準對齊上面 OnClientConnected 的 Key，確保 100% 抓得到人
+            var playerKey = (uint)player.Slot + 1;
+
+            if (player.ControllingBot || !_gPlayerInfo.TryGetValue(playerKey, out var data) || data == null)
                 continue;
 
             if (player is { LifeState: (byte)LifeState_t.LIFE_ALIVE, Team: CsTeam.Terrorist or CsTeam.CounterTerrorist })
