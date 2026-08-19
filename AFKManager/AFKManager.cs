@@ -20,14 +20,14 @@ public class AFKManagerConfig : BasePluginConfig
 
 public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
 {
-    public override string ModuleAuthor => "NiGHT & K4ryuu (Cleaned)";
+    public override string ModuleAuthor => "NiGHT & K4ryuu (Cleaned & Fixed)";
     public override string ModuleName => "AFK Manager (Lite)";
-    public override string ModuleVersion => "1.0.0";
+    public override string ModuleVersion => "1.0.1_RespawnFix"; // 標記為加入重生修復版
     
     public required AFKManagerConfig Config { get; set; }
     private CCSGameRules? _gGameRulesProxy;
     
-    // .NET 10 集合表達式 (Collection Expression) 簡化實例化
+    //  .NET 10 集合表達式 (Collection Expression) 簡化實例化
     private readonly Dictionary<uint, PlayerInfo> _gPlayerInfo = []; 
     
     public void OnConfigParsed(AFKManagerConfig config)
@@ -66,24 +66,47 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
         RegisterListener<Listeners.OnClientConnected>(playerSlot =>
         {
             var finalSlot = (uint)playerSlot + 1;
-            
-            // 使用現代 Dictionary 的 TryAdd 提升效能，並搭配 target-typed new()
+            // 使用現代 Dictionary 的 TryAdd 提升效能
             _gPlayerInfo.TryAdd(finalSlot, new PlayerInfo { Angles = new(), Origin = new() });
         });
         
         RegisterListener<Listeners.OnClientDisconnectPost>(playerSlot => _gPlayerInfo.Remove((uint)playerSlot + 1));
+
+        // 核心修復：攔截玩家重生，防止 AFK 狀態被死亡/換局傳送給洗白
+        RegisterEventHandler<EventPlayerSpawn>((@event, info) =>
+        {
+            if (@event.Userid is not { IsValid: true, IsBot: false, Connected: PlayerConnectedState.Connected } player)
+                return HookResult.Continue;
+
+            if (_gPlayerInfo.TryGetValue(player.Index, out var data) && data is not null)
+            {
+                // 在重生的下一幀抓取準確的重生點座標
+                Server.NextFrame(() =>
+                {
+                    if (player is { IsValid: true, PawnIsAlive: true } && player.PlayerPawn.Value is { } pawn)
+                    {
+                        var angles = pawn.EyeAngles;
+                        var origin = pawn.CBodyComponent?.SceneNode?.AbsOrigin;
+
+                        // 關鍵：只更新基準座標，絕對「不清除」累積的 AfkTime 與 AfkWarningCount！
+                        data.Angles = new(angles?.X, angles?.Y, angles?.Z);
+                        data.Origin = new(origin?.X, origin?.Y, origin?.Z);
+                    }
+                });
+            }
+            return HookResult.Continue;
+        });
     }
 
     private void AfkTimer_Callback()
     {
-        // C# 屬性模式匹配，取代又長又臭的 == null 與多重判斷
+        // 轉換為現代 C# 屬性模式匹配防護
         if (_gGameRulesProxy is null or { FreezePeriod: true } || (Config.SkipWarmup && _gGameRulesProxy is { WarmupPeriod: true }))
             return;
 
-        // 直接整合進 foreach，徹底消滅記憶體分配！
         foreach (var player in Utilities.GetPlayers())
         {
-            // 使用 is not 模式匹配反向過濾
+            // 使用 is not 模式匹配反向過濾，效能遠超 LINQ
             if (player is not { IsBot: false, Connected: PlayerConnectedState.Connected }) 
                 continue;
 
@@ -130,9 +153,9 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
                 }
                 else
                 {
+                    // 只要座標改變（玩家真的移動了），才把 AFK 計時歸零
                     data.AfkTime = 0;
                     data.AfkWarningCount = 0;
-                    // 縮寫寫法
                     data.Angles = new(angles?.X, angles?.Y, angles?.Z);
                     data.Origin = new(origin?.X, origin?.Y, origin?.Z);
                 }
