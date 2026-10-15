@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
@@ -25,7 +27,9 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
     public override string ModuleVersion => "2.0.0_UltimateZeroGC";
     
     public required AFKManagerConfig Config { get; set; }
+    private CCSGameRulesProxy? _gGameRulesProxyEntity;
     private CCSGameRules? _gGameRulesProxy;
+    private CounterStrikeSharp.API.Modules.Timers.Timer? _afkTimer;
     
     private readonly Dictionary<uint, PlayerInfo> _gPlayerInfo = []; 
     
@@ -35,7 +39,8 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
     public void OnConfigParsed(AFKManagerConfig config)
     {
         Config = config;
-        AddTimer(Config.Timer, AfkTimer_Callback, TimerFlags.REPEAT);
+        _afkTimer?.Kill();
+        _afkTimer = AddTimer(Config.Timer, AfkTimer_Callback, TimerFlags.REPEAT);
     }
 
     private class PlayerInfo
@@ -49,7 +54,31 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
         public int AfkWarningCount;
     }
 
-    // 更新快取名單的函數 (O(N) 極速重構，0 記憶體分配)
+    // 安全取得並快取 GameRules，徹底消除 OnMapStart 第一幀抓不到實體或換圖指標懸空崩潰的問題
+    private CCSGameRules? GetSafeGameRules()
+    {
+        if (_gGameRulesProxyEntity is { IsValid: true, GameRules: { } rules })
+        {
+            _gGameRulesProxy = rules;
+            return rules;
+        }
+
+        _gGameRulesProxyEntity = null;
+        _gGameRulesProxy = null;
+
+        foreach (var entity in Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules"))
+        {
+            if (entity is { IsValid: true, GameRules: { } validRules })
+            {
+                _gGameRulesProxyEntity = entity;
+                _gGameRulesProxy = validRules;
+                return validRules;
+            }
+        }
+        return null;
+    }
+
+    // 更新快取名單的函數 (O(N) 極速重構，0 記憶體分配，並自動補齊遺漏的 PlayerInfo)
     private void RefreshPlayersCache()
     {
         _activePlayersCache.Clear();
@@ -58,26 +87,47 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
             if (p is { IsValid: true, IsBot: false, Connected: PlayerConnectedState.Connected })
             {
                 _activePlayersCache.Add(p);
+                if (!_gPlayerInfo.ContainsKey(p.Index))
+                {
+                    _gPlayerInfo[p.Index] = new PlayerInfo();
+                }
             }
+        }
+    }
+
+    // 純數值更新基準座標，無 new 記憶體分配，且不清除 AFK 累積時間與警告次數
+    private void SyncPlayerBaseline(CCSPlayerController player, PlayerInfo data)
+    {
+        if (player is { IsValid: true, PawnIsAlive: true } && player.PlayerPawn.Value is { IsValid: true } pawn)
+        {
+            var angles = pawn.EyeAngles;
+            var origin = pawn.CBodyComponent?.SceneNode?.AbsOrigin;
+
+            data.AngleX = angles?.X ?? 0; data.AngleY = angles?.Y ?? 0; data.AngleZ = angles?.Z ?? 0;
+            data.OriginX = origin?.X ?? 0; data.OriginY = origin?.Y ?? 0; data.OriginZ = origin?.Z ?? 0;
+            data.IsTracking = true;
         }
     }
 
     public override void Load(bool hotReload)
     {
+        RegisterEventHandler<EventMapShutdown>((@event, info) =>
+        {
+            _gGameRulesProxyEntity = null;
+            _gGameRulesProxy = null;
+            _activePlayersCache.Clear();
+            return HookResult.Continue;
+        });
+
         RegisterListener<Listeners.OnMapStart>(_ =>
         {
-            Server.NextFrame(() =>
+            _gGameRulesProxyEntity = null;
+            _gGameRulesProxy = null;
+            _activePlayersCache.Clear();
+
+            AddTimer(1.0f, () =>
             {
-                _gGameRulesProxy = null;
-                foreach (var entity in Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules"))
-                {
-                    _gGameRulesProxy = entity.GameRules;
-                    break;
-                }
-                
-                if (_gGameRulesProxy is null)
-                    throw new Exception("Failed to find game rules proxy entity.");
-                    
+                GetSafeGameRules();
                 RefreshPlayersCache();
             });
         });
@@ -86,7 +136,16 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
         {
             var finalSlot = (uint)playerSlot + 1;
             // 使用 target-typed new() 僅在連線時分配一次記憶體
-            _gPlayerInfo.TryAdd(finalSlot, new PlayerInfo());
+            if (_gPlayerInfo.TryGetValue(finalSlot, out var existing))
+            {
+                existing.AfkTime = 0;
+                existing.AfkWarningCount = 0;
+                existing.IsTracking = false;
+            }
+            else
+            {
+                _gPlayerInfo.TryAdd(finalSlot, new PlayerInfo());
+            }
         });
         
         RegisterEventHandler<EventPlayerConnectFull>((@event, info) => 
@@ -107,29 +166,53 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
             if (@event.Userid is not { IsValid: true, IsBot: false, Connected: PlayerConnectedState.Connected } player)
                 return HookResult.Continue;
 
-            if (_gPlayerInfo.TryGetValue(player.Index, out var data) && data is not null)
+            if (!_gPlayerInfo.TryGetValue(player.Index, out var data) || data is null)
             {
-                Server.NextFrame(() =>
-                {
-                    if (player is { IsValid: true, PawnIsAlive: true } && player.PlayerPawn.Value is { } pawn)
-                    {
-                        var angles = pawn.EyeAngles;
-                        var origin = pawn.CBodyComponent?.SceneNode?.AbsOrigin;
-
-                        // 純數值更新基準座標，無 new 記憶體分配，且不清除 AFK 累積時間
-                        data.AngleX = angles?.X ?? 0; data.AngleY = angles?.Y ?? 0; data.AngleZ = angles?.Z ?? 0;
-                        data.OriginX = origin?.X ?? 0; data.OriginY = origin?.Y ?? 0; data.OriginZ = origin?.Z ?? 0;
-                        data.IsTracking = true;
-                    }
-                });
+                data = new PlayerInfo();
+                _gPlayerInfo[player.Index] = data;
             }
+
+            // 推遲 0.25 秒等待角色落地與外部插件 (如 MatchZy 0.15s 重生點校正) 傳送完畢後再紀錄基準點
+            AddTimer(0.25f, () =>
+            {
+                SyncPlayerBaseline(player, data);
+            });
             return HookResult.Continue;
         });
+
+        // 買槍凍結結束瞬間再次無損同步座標基準，防止凍結期間因物理微調導致誤洗白上一局累積的 AFK 警告
+        RegisterEventHandler<EventRoundFreezeEnd>((@event, info) =>
+        {
+            Server.NextFrame(() =>
+            {
+                foreach (var player in _activePlayersCache)
+                {
+                    if (player is { IsValid: true, LifeState: (byte)LifeState_t.LIFE_ALIVE, Team: CsTeam.Terrorist or CsTeam.CounterTerrorist })
+                    {
+                        if (_gPlayerInfo.TryGetValue(player.Index, out var data) && data is not null)
+                        {
+                            SyncPlayerBaseline(player, data);
+                        }
+                    }
+                }
+            });
+            return HookResult.Continue;
+        });
+
+        if (hotReload)
+        {
+            Server.NextFrame(() =>
+            {
+                GetSafeGameRules();
+                RefreshPlayersCache();
+            });
+        }
     }
 
     private void AfkTimer_Callback()
     {
-        if (_gGameRulesProxy is null or { FreezePeriod: true } || (Config.SkipWarmup && _gGameRulesProxy is { WarmupPeriod: true }))
+        var gameRules = GetSafeGameRules();
+        if (gameRules is null or { FreezePeriod: true } || (Config.SkipWarmup && gameRules is { WarmupPeriod: true }))
             return;
 
         // 直接讀取 C# 記憶體內的快取名單，不再跨界呼叫底層 C++
@@ -138,12 +221,17 @@ public class AFKManager : BasePlugin, IPluginConfig<AFKManagerConfig>
             // 雙重防護，確保快取中的玩家尚未斷線
             if (player is not { IsValid: true }) continue; 
 
-            if (player.ControllingBot || !_gPlayerInfo.TryGetValue(player.Index, out var data) || data is null)
-                continue;
+            if (player.ControllingBot) continue;
+
+            if (!_gPlayerInfo.TryGetValue(player.Index, out var data) || data is null)
+            {
+                data = new PlayerInfo();
+                _gPlayerInfo[player.Index] = data;
+            }
 
             if (player is { LifeState: (byte)LifeState_t.LIFE_ALIVE, Team: CsTeam.Terrorist or CsTeam.CounterTerrorist })
             {
-                if (player.PlayerPawn.Value is not { } playerPawn) continue;
+                if (player.PlayerPawn.Value is not { IsValid: true } playerPawn) continue;
 
                 var angles = playerPawn.EyeAngles;
                 var origin = playerPawn.CBodyComponent?.SceneNode?.AbsOrigin;
